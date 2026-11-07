@@ -3,7 +3,7 @@
  *
  * 起動:
  *   make run
- *   make run GPU_A=0 GPU_B=1 MAX_MB=1024 ITERS=0
+ *   make run GPU_A=0 GPU_B=1 MAX_MB=16384 ITERS=0
  *   ./p2p-bw [gpu_a] [gpu_b] [max_mb] [iters]
  *   P2P_CHUNK_MB=8 ./p2p-bw          # ホスト経由転送のチャンクサイズ (1..256)
  *
@@ -742,7 +742,7 @@ static SimSample bench_host_both(DevHost& a, DevHost& b, size_t bytes, int iters
     return s;
 }
 
-/* 読み出したホストメモリを CPU で全ワード照合する。最大 1 GiB 程度を想定。 */
+/* 読み出したホストメモリを CPU で全ワード照合する。既定の上限は 16 GiB。 */
 static bool verify_host_pattern(const char* label, void* host, size_t bytes, uint32_t seed) {
     const auto* p = static_cast<const uint32_t*>(host);
     const size_t n = bytes / sizeof(uint32_t);
@@ -871,7 +871,7 @@ static bool verify_copy(const char* label, int dev, void* ptr, size_t bytes, uin
 int main(int argc, char** argv) {
     int gpu_a = 0;
     int gpu_b = 1;
-    unsigned long long max_mb = 1024;
+    unsigned long long max_mb = 16384;
     int fixed_iters = 0;
     if (argc >= 3) {
         gpu_a = atoi(argv[1]);
