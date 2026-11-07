@@ -2,13 +2,13 @@
 # 計測内容と帯域の定義は p2p_bw.hip 冒頭のコメントを参照。
 #
 #   make run
-#   make run GPU_A=0 GPU_B=1 MAX_MB=8192 ITERS=0
+#   make run GPU_A=0 GPU_B=1 MAX_MB=4096 ITERS=0
 #
 # ITERS=0 はサイズごとに反復回数を自動選択する。
 
 GPU_A  ?= 0
 GPU_B  ?= 1
-MAX_MB ?= 8192
+MAX_MB ?= 4096
 ITERS  ?= 0
 
 ROCM       ?= /opt/rocm
