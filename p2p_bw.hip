@@ -115,6 +115,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 #include <vector>
 
 /* API の失敗は計測値として扱わない。呼び出し地点を残して終了する。 */
@@ -347,6 +348,41 @@ static void print_theory(double measured, double theory) {
         printf("   理論ピーク不明");
     }
     printf("\n");
+}
+
+/* 端末のときだけ色を付ける。パイプやファイルへは素の文字で出す。 */
+static bool stdout_color() {
+    static int on = -1;
+    if (on < 0) on = isatty(fileno(stdout)) ? 1 : 0;
+    return on == 1;
+}
+static const char* ansi(const char* code) {
+    return stdout_color() ? code : "";
+}
+
+/*
+ * 開始直後に出す PCIe 概要。タイプと理論帯域は、経路の最も遅いホップ
+ * （Host 転送が実際に通る上限）であり、デバイス直結の速度ではない。
+ */
+static void print_pcie_startup(int gpu, const PciePeak& p, bool ok) {
+    const char* reset = ansi("\033[0m");
+    const char* cyan = ansi("\033[1;36m");
+    const char* yellow = ansi("\033[1;33m");
+    const char* green = ansi("\033[1;32m");
+    const char* dim = ansi("\033[2m");
+    if (!ok) {
+        printf("  %sGPU %d%s  %sPCIe タイプを取得できません%s\n", cyan, gpu, reset, yellow, reset);
+        return;
+    }
+    printf("  %sGPU %d%s  %sPCIe %d.0 x%d%s  理論帯域 %s%.2f GB/s%s（片方向）\n",
+           cyan, gpu, reset, yellow, p.gen, p.lanes, reset, green, p.uni_gbps, reset);
+    const bool same = p.endpoint.ok && p.endpoint.gen == p.limit.gen &&
+                      p.endpoint.lanes == p.limit.lanes;
+    if (!same && p.endpoint.ok) {
+        printf("  %s    デバイス直結 %s は PCIe %d.0 x%d（%.2f GB/s）。上限は %s の %.1f GT/s x%d%s\n",
+               dim, p.endpoint.bdf, p.endpoint.gen, p.endpoint.lanes, p.endpoint.uni_gbps,
+               p.limit.bdf, p.limit.gt, p.limit.lanes, reset);
+    }
 }
 
 /*
@@ -1039,8 +1075,6 @@ int main(int argc, char** argv) {
     printf("║   ROCm 2-GPU VRAM 転送帯域                   ║\n");
     printf("╚══════════════════════════════════════════════╝\n\n");
 
-    print_devices();
-
     int count = 0;
     HIP_CHECK(hipGetDeviceCount(&count));
     if (count < 2) {
@@ -1052,6 +1086,22 @@ int main(int argc, char** argv) {
                 gpu_a, gpu_b, count - 1);
         return 1;
     }
+
+    PciePeak pcie_a{};
+    PciePeak pcie_b{};
+    const bool pcie_a_ok = query_pcie_peak(gpu_a, pcie_a);
+    const bool pcie_b_ok = query_pcie_peak(gpu_b, pcie_b);
+    printf("%s=== PCIe ===%s\n", ansi("\033[1;36m"), ansi("\033[0m"));
+    print_pcie_startup(gpu_a, pcie_a, pcie_a_ok);
+    print_pcie_startup(gpu_b, pcie_b, pcie_b_ok);
+    if (pcie_a_ok && pcie_b_ok) {
+        printf("  %s両 GPU 合計%s  理論帯域 %s%.2f GB/s%s（片方向の和）\n",
+               ansi("\033[1;36m"), ansi("\033[0m"),
+               ansi("\033[1;32m"), pcie_a.uni_gbps + pcie_b.uni_gbps, ansi("\033[0m"));
+    }
+    printf("\n");
+
+    print_devices();
 
     printf("=== リンク GPU %d ↔ GPU %d ===\n", gpu_a, gpu_b);
     uint32_t link = 0, hops = 0;
@@ -1291,10 +1341,6 @@ int main(int argc, char** argv) {
     printf("  GPU 間の方式:         %s\n",
            use_peer ? "ピア直接 (hipMemcpyPeerAsync)" : "ホスト経由ダブルバッファ");
 
-    PciePeak pcie_a{};
-    PciePeak pcie_b{};
-    const bool pcie_a_ok = query_pcie_peak(gpu_a, pcie_a);
-    const bool pcie_b_ok = query_pcie_peak(gpu_b, pcie_b);
     const bool xgmi = (link_err == hipSuccess && link == 4);
     double theory_ab = 0.0, theory_ba = 0.0, theory_bi = 0.0;
     const double theory_wa = pcie_a_ok ? pcie_a.uni_gbps : 0.0;
