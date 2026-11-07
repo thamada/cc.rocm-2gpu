@@ -28,6 +28,19 @@
  * 表示の「1回転送」は 1 回分の所要時間。双方向と「同時合計」は、
  * 同じ時間に動いた両方向（または両 GPU）のバイト数を足して割った値。
  *
+ * サマリの理論ピークは、GPU からルートポートまでの各ホップで sysfs が示す
+ * 交渉済み速度・幅のうち、片方向ペイロードが最も小さいリンクである。
+ * デバイス直結が 32 GT/s x16 でも、上流のブリッジが 8 GT/s x16 なら
+ * 後者が Host 転送の上限になる。端点の速度だけで世代を決めない。
+ * 符号化は Gen1/2 が 8b/10b、Gen3–5 が 128b/130b、Gen6 が FLIT の 242/256。
+ * 実行効率は 実測 ÷ その最遅リンクの片方向ピーク。
+ *   Host の単独     その GPU の経路で最も遅いホップ
+ *   Host の同時合計 両 GPU それぞれの最遅ホップの和
+ *   GPU 間の片方向  両 GPU の最遅ホップのうち遅い方
+ *   GPU 間の双方向  上の 2 倍（PCIe は全二重）
+ * xGMI のとき GPU 間の帯域上限は PCIe では置けないので、その行は
+ * 「理論ピーク不明」にする。Host↔VRAM は xGMI でも各 GPU の PCIe 経路を使う。
+ *
  * ---------------------------------------------------------------------------
  * GPU 間の経路
  * ---------------------------------------------------------------------------
@@ -131,7 +144,31 @@ struct XferSample {
     int iters;
     double ms_each;
     double gbps;
-};;
+};
+
+/*
+ * 交渉済み PCIe の 1 ホップ。片方向ペイロードの単位は GB/s = 10^9 バイト/秒。
+ * GT/s はレーンあたりの生レートで、符号化の分だけペイロードはそれより少ない。
+ */
+struct PcieHop {
+    bool ok;
+    char bdf[32];
+    double gt;
+    int lanes;
+    int gen;
+    double uni_gbps;
+};
+
+/* endpoint はデバイス直結。limit はルートまでの経路で最も遅いホップ。 */
+struct PciePeak {
+    bool ok;
+    PcieHop endpoint;
+    PcieHop limit;
+    double gt;
+    int lanes;
+    int gen;
+    double uni_gbps;
+};
 
 /*
  * 検証用の 32bit パターン。インデックスとシードから一意に再現できるので、
@@ -193,6 +230,123 @@ static void fmt_time(char* buf, size_t nbuf, double ms) {
 static double gb_per_s(double bytes, double ms) {
     if (ms <= 0.0) return 0.0;
     return bytes / (ms * 1e-3) / 1e9;
+}
+
+/*
+ * 交渉済み PCIe リンクの片方向ペイロード。単位は GB/s = 10^9 バイト/秒。
+ * GT/s はレーンあたりの生レート。符号化の分だけペイロードはそれより少ない。
+ */
+static int pcie_gen_from_gt(double gt) {
+    if (gt < 3.5) return 1;
+    if (gt < 6.5) return 2;
+    if (gt < 12.0) return 3;
+    if (gt < 24.0) return 4;
+    if (gt < 48.0) return 5;
+    return 6;
+}
+
+static double pcie_uni_gbps(double gt, int lanes) {
+    double eff;
+    if (gt < 6.5) eff = 8.0 / 10.0;
+    else if (gt < 48.0) eff = 128.0 / 130.0;
+    else eff = 242.0 / 256.0;
+    return gt * eff * (double)lanes / 8.0;
+}
+
+/* HIP の PCI アドレスから上流へ辿り、経路上で実測された最も遅いリンクを返す。 */
+static bool pci_bdf_name(const char* s) {
+    unsigned domain = 0, bus = 0, dev = 0, fn = 0;
+    char tail = 0;
+    return sscanf(s, "%x:%x:%x.%x%c", &domain, &bus, &dev, &fn, &tail) == 4;
+}
+
+static bool read_pcie_hop(const char* bdf, PcieHop& hop) {
+    hop = {};
+    char speed_path[160];
+    char width_path[160];
+    snprintf(speed_path, sizeof(speed_path), "/sys/bus/pci/devices/%s/current_link_speed", bdf);
+    snprintf(width_path, sizeof(width_path), "/sys/bus/pci/devices/%s/current_link_width", bdf);
+
+    FILE* fs = fopen(speed_path, "r");
+    FILE* fw = fopen(width_path, "r");
+    if (!fs || !fw) {
+        if (fs) fclose(fs);
+        if (fw) fclose(fw);
+        return false;
+    }
+
+    char line[64] = {};
+    const bool got_speed = fgets(line, (int)sizeof(line), fs) != nullptr;
+    fclose(fs);
+    int lanes = 0;
+    const bool got_width = fscanf(fw, "%d", &lanes) == 1;
+    fclose(fw);
+    if (!got_speed || !got_width || lanes <= 0) return false;
+
+    double gt = 0.0;
+    if (sscanf(line, "%lf", &gt) != 1 || gt <= 0.0) return false;
+
+    hop.ok = true;
+    snprintf(hop.bdf, sizeof(hop.bdf), "%s", bdf);
+    hop.gt = gt;
+    hop.lanes = lanes;
+    hop.gen = pcie_gen_from_gt(gt);
+    hop.uni_gbps = pcie_uni_gbps(gt, lanes);
+    return true;
+}
+
+static bool query_pcie_peak(int dev, PciePeak& out) {
+    out = {};
+    hipDeviceProp_t prop{};
+    HIP_CHECK(hipGetDeviceProperties(&prop, dev));
+    char bdf[32] = {};
+    if (hipDeviceGetPCIBusId(bdf, (int)sizeof(bdf), dev) != hipSuccess) {
+        (void)hipGetLastError();
+        snprintf(bdf, sizeof(bdf), "%04x:%02x:%02x.0",
+                 prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+    }
+
+    char cur[32];
+    snprintf(cur, sizeof(cur), "%s", bdf);
+    bool any = false;
+    /* 同じ速度のホップが続いたときは、より上流（ルートに近い側）を残す。 */
+    for (int guard = 0; guard < 16 && pci_bdf_name(cur); guard++) {
+        PcieHop hop{};
+        if (read_pcie_hop(cur, hop)) {
+            if (!any) out.endpoint = hop;
+            if (!out.limit.ok || hop.uni_gbps <= out.limit.uni_gbps) out.limit = hop;
+            any = true;
+        }
+
+        char syspath[160];
+        snprintf(syspath, sizeof(syspath), "/sys/bus/pci/devices/%s", cur);
+        char real[4096];
+        if (!realpath(syspath, real)) break;
+        char* slash = strrchr(real, '/');
+        if (!slash || slash == real) break;
+        *slash = '\0';
+        const char* parent = strrchr(real, '/');
+        parent = parent ? parent + 1 : real;
+        if (!pci_bdf_name(parent) || strcmp(parent, cur) == 0) break;
+        snprintf(cur, sizeof(cur), "%s", parent);
+    }
+    if (!any) return false;
+
+    out.ok = true;
+    out.gt = out.limit.gt;
+    out.lanes = out.limit.lanes;
+    out.gen = out.limit.gen;
+    out.uni_gbps = out.limit.uni_gbps;
+    return true;
+}
+
+static void print_theory(double measured, double theory) {
+    if (theory > 0.0) {
+        printf("   理論 %6.2f GB/s   効率 %5.1f%%", theory, 100.0 * measured / theory);
+    } else {
+        printf("   理論ピーク不明");
+    }
+    printf("\n");
 }
 
 /*
@@ -1136,15 +1290,67 @@ int main(int argc, char** argv) {
     printf("=== サマリ ===\n");
     printf("  GPU 間の方式:         %s\n",
            use_peer ? "ピア直接 (hipMemcpyPeerAsync)" : "ホスト経由ダブルバッファ");
-    printf("  ピーク %d → %d:      %6.2f GB/s @ %s\n", gpu_a, gpu_b, peak_ab->gbps, sz_ab);
-    printf("  ピーク %d → %d:      %6.2f GB/s @ %s\n", gpu_b, gpu_a, peak_ba->gbps, sz_ba);
-    printf("  ピーク双方向合計:    %6.2f GB/s @ %s\n", peak_bi->gbps, sz_bi);
-    printf("  書込 単独 GPU %d:    %6.2f GB/s @ %s\n", gpu_a, peak_wa.gbps, sz_wa);
-    printf("  書込 単独 GPU %d:    %6.2f GB/s @ %s\n", gpu_b, peak_wb.gbps, sz_wb);
-    printf("  書込 同時合計:       %6.2f GB/s @ %s\n", peak_wsum.gbps, sz_ws);
-    printf("  読出 単独 GPU %d:    %6.2f GB/s @ %s\n", gpu_a, peak_ra.gbps, sz_ra);
-    printf("  読出 単独 GPU %d:    %6.2f GB/s @ %s\n", gpu_b, peak_rb.gbps, sz_rb);
-    printf("  読出 同時合計:       %6.2f GB/s @ %s\n", peak_rsum.gbps, sz_rs);
+
+    PciePeak pcie_a{};
+    PciePeak pcie_b{};
+    const bool pcie_a_ok = query_pcie_peak(gpu_a, pcie_a);
+    const bool pcie_b_ok = query_pcie_peak(gpu_b, pcie_b);
+    const bool xgmi = (link_err == hipSuccess && link == 4);
+    double theory_ab = 0.0, theory_ba = 0.0, theory_bi = 0.0;
+    const double theory_wa = pcie_a_ok ? pcie_a.uni_gbps : 0.0;
+    const double theory_wb = pcie_b_ok ? pcie_b.uni_gbps : 0.0;
+    const double theory_host_sum = (pcie_a_ok && pcie_b_ok) ? pcie_a.uni_gbps + pcie_b.uni_gbps : 0.0;
+    if (!xgmi && pcie_a_ok && pcie_b_ok) {
+        const double slower = std::min(pcie_a.uni_gbps, pcie_b.uni_gbps);
+        theory_ab = slower;
+        theory_ba = slower;
+        theory_bi = slower * 2.0;
+    }
+
+    printf("  理論ピークの基準:     GPU からルートポートまでの経路で、実測された最も遅いホップ\n");
+    auto print_pcie = [](int gpu, const PciePeak& p, bool ok) {
+        if (!ok) {
+            printf("    GPU %d               リンク速度を取得できません\n", gpu);
+            return;
+        }
+        printf("    GPU %d  経路の最遅 %s  PCIe %d.0 x%d  %.1f GT/s  片方向 %.2f GB/s\n",
+               gpu, p.limit.bdf, p.gen, p.lanes, p.gt, p.uni_gbps);
+        const bool same = p.endpoint.ok && p.endpoint.gen == p.limit.gen &&
+                          p.endpoint.lanes == p.limit.lanes &&
+                          p.endpoint.gt == p.limit.gt;
+        if (!same && p.endpoint.ok) {
+            printf("           デバイス直結 %s  PCIe %d.0 x%d  %.1f GT/s  片方向 %.2f GB/s\n",
+                   p.endpoint.bdf, p.endpoint.gen, p.endpoint.lanes,
+                   p.endpoint.gt, p.endpoint.uni_gbps);
+        }
+    };
+    print_pcie(gpu_a, pcie_a, pcie_a_ok);
+    print_pcie(gpu_b, pcie_b, pcie_b_ok);
+    if (xgmi) {
+        printf("    GPU 間は xGMI のため、PCIe では上限を置かない\n");
+    } else {
+        printf("    GPU 間の片方向は両経路の遅い方、双方向合計はその 2 倍\n");
+        printf("    Host の単独はその GPU の最遅ホップ、同時合計は両経路の和\n");
+    }
+
+    printf("  ピーク %d → %d:      %6.2f GB/s @ %s", gpu_a, gpu_b, peak_ab->gbps, sz_ab);
+    print_theory(peak_ab->gbps, theory_ab);
+    printf("  ピーク %d → %d:      %6.2f GB/s @ %s", gpu_b, gpu_a, peak_ba->gbps, sz_ba);
+    print_theory(peak_ba->gbps, theory_ba);
+    printf("  ピーク双方向合計:    %6.2f GB/s @ %s", peak_bi->gbps, sz_bi);
+    print_theory(peak_bi->gbps, theory_bi);
+    printf("  書込 単独 GPU %d:    %6.2f GB/s @ %s", gpu_a, peak_wa.gbps, sz_wa);
+    print_theory(peak_wa.gbps, theory_wa);
+    printf("  書込 単独 GPU %d:    %6.2f GB/s @ %s", gpu_b, peak_wb.gbps, sz_wb);
+    print_theory(peak_wb.gbps, theory_wb);
+    printf("  書込 同時合計:       %6.2f GB/s @ %s", peak_wsum.gbps, sz_ws);
+    print_theory(peak_wsum.gbps, theory_host_sum);
+    printf("  読出 単独 GPU %d:    %6.2f GB/s @ %s", gpu_a, peak_ra.gbps, sz_ra);
+    print_theory(peak_ra.gbps, theory_wa);
+    printf("  読出 単独 GPU %d:    %6.2f GB/s @ %s", gpu_b, peak_rb.gbps, sz_rb);
+    print_theory(peak_rb.gbps, theory_wb);
+    printf("  読出 同時合計:       %6.2f GB/s @ %s", peak_rsum.gbps, sz_rs);
+    print_theory(peak_rsum.gbps, theory_host_sum);
     printf("  検証:                 %s\n\n", (ok_ab && ok_ba && ok_host) ? "OK" : "失敗");
 
     devhost_destroy(host_b);
