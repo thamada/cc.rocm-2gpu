@@ -386,6 +386,27 @@ static void print_pcie_startup(int gpu, const PciePeak& p, bool ok) {
 }
 
 /*
+ * 表示している PCIe タイプは、経路の最遅ホップの世代とレーン数。
+ * ここが 2 台で違うときだけ、白文字・赤背景で警告する。
+ */
+static void print_pcie_type_warning(int gpu_a, const PciePeak& a, bool a_ok,
+                                    int gpu_b, const PciePeak& b, bool b_ok) {
+    if (a_ok && b_ok && a.gen == b.gen && a.lanes == b.lanes) return;
+    const char* reset = ansi("\033[0m");
+    const char* alert = ansi("\033[1;97;41m");
+    if (!a_ok || !b_ok) {
+        printf("  %s 警告: GPU %d と GPU %d の PCIe タイプを比較できません。片方のリンク情報を読めません。 %s\n",
+               alert, gpu_a, gpu_b, reset);
+        return;
+    }
+    printf("  %s 警告: PCIe タイプが異なります。GPU %d は PCIe %d.0 x%d（%.2f GB/s）、GPU %d は PCIe %d.0 x%d（%.2f GB/s）。 %s\n",
+           alert,
+           gpu_a, a.gen, a.lanes, a.uni_gbps,
+           gpu_b, b.gen, b.lanes, b.uni_gbps,
+           reset);
+}
+
+/*
  * 反復回数。固定値が来ればそれを使う。
  * 自動のときは、そのサイズでおよそ 2 GiB 運ぶ回数にする。
  * 小さいサイズは 1 回が数マイクロ秒しかなく、イベントの分解能に負けるので
@@ -1094,6 +1115,7 @@ int main(int argc, char** argv) {
     printf("%s=== PCIe ===%s\n", ansi("\033[1;36m"), ansi("\033[0m"));
     print_pcie_startup(gpu_a, pcie_a, pcie_a_ok);
     print_pcie_startup(gpu_b, pcie_b, pcie_b_ok);
+    print_pcie_type_warning(gpu_a, pcie_a, pcie_a_ok, gpu_b, pcie_b, pcie_b_ok);
     if (pcie_a_ok && pcie_b_ok) {
         printf("  %s両 GPU 合計%s  理論帯域 %s%.2f GB/s%s（片方向の和）\n",
                ansi("\033[1;36m"), ansi("\033[0m"),
